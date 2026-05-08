@@ -57,20 +57,20 @@ Three processes need to be running:
 
 **1. Backend** (FastAPI server, port 8000)
 ```bash
-cd "Overlay LoL"
+cd "MacScout"
 uvicorn main:app --reload
 ```
 
 **2. Frontend dev server** (Vite, port 5173)
 ```bash
-cd "Overlay LoL/frontend"
+cd "Overlay MacScout/frontend"
 npm install   # first time only
 npm run dev
 ```
 
 **3. Electron overlay** (transparent floating window)
 ```bash
-cd "Overlay LoL/frontend"
+cd "MacScout/frontend"
 npm run electron
 ```
 
@@ -98,4 +98,4 @@ Note that personal dev keys expire every 24 hours.
 
 ## Why this exists
 
-Every major LoL stats overlay (OP.GG Desktop, Porofessor, Mobalytics) is Windows-only. Mac players have to alt-tab to a browser. This project closes that gap and was a chance to build something against three completely different APIs (a local websocket-ish auth flow, an undocumented localhost endpoint, and a public REST API).
+Every major League of Legends stats overlay (OP.GG Desktop, Porofessor, Mobalytics) is Windows-only. Mac players have to alt-tab to a browser. This project closes that gap and was a chance to build something against three completely different APIs (a local websocket-ish auth flow, an undocumented localhost endpoint, and a public REST API).
