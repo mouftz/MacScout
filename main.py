@@ -147,10 +147,13 @@ def compute_trends(matches: list, all_matches: list = None, current_champion: st
             "avg_cs_per_min": None,
             "mains": [],
             "streak": {"type": None, "count": 0},
+            "main_role": None,
+            "games_today": 0,
+            "wins_today": 0,
             "tag": None,
         }
     
-    # === Averages ===
+    # Use broader pool for averages/mains/role when available
     pool = all_matches if all_matches else matches
     
     # === Averages ===
@@ -159,10 +162,8 @@ def compute_trends(matches: list, all_matches: list = None, current_champion: st
     avg_deaths = sum(m['deaths'] for m in pool) / n
     avg_assists = sum(m['assists'] for m in pool) / n
     
-    # KDA ratio: (K + A) / D, but avoid divide-by-zero
     kda_ratio = (avg_kills + avg_assists) / avg_deaths if avg_deaths > 0 else (avg_kills + avg_assists)
     
-    # CS/min: total cs across all games divided by total minutes
     total_cs = sum(m['cs'] for m in pool)
     total_seconds = sum(m['game_duration'] for m in pool)
     avg_cs_per_min = (total_cs / (total_seconds / 60)) if total_seconds > 0 else 0
@@ -171,17 +172,27 @@ def compute_trends(matches: list, all_matches: list = None, current_champion: st
     champ_counts = {}
     for m in pool:
         champ_counts[m['champion']] = champ_counts.get(m['champion'], 0) + 1
-    
-    # === Most played champions ===
-    champ_counts = {}
-    for m in matches:
-        champ_counts[m['champion']] = champ_counts.get(m['champion'], 0) + 1
-    # Sort by count descending, take top 3
     mains = sorted(champ_counts.items(), key=lambda x: x[1], reverse=True)[:3]
     mains = [{"champion": c, "games": count} for c, count in mains]
     
-    # === Streak (look at most-recent matches first) ===
-    # Riot returns matches newest-first, so matches[0] is the most recent
+    # === Most played role ===
+    role_counts = {}
+    for m in pool:
+        position = m.get('position', '')
+        # Skip empty/invalid positions (ARAM, urf, custom)
+        if position and position not in ('Invalid', ''):
+            role_counts[position] = role_counts.get(position, 0) + 1
+    
+    main_role = None
+    if role_counts:
+        top_role, top_count = max(role_counts.items(), key=lambda x: x[1])
+        main_role = {
+            "role": top_role,
+            "games": top_count,
+            "total_with_role": sum(role_counts.values()),
+        }
+    
+    # === Streak (queue-filtered) ===
     streak_type = None
     streak_count = 0
     if matches:
@@ -193,36 +204,69 @@ def compute_trends(matches: list, all_matches: list = None, current_champion: st
                 break
         streak_type = "win" if first_result else "loss"
     
+    # === Games today (across all queues) ===
+    # game_end is in milliseconds since epoch
+    twenty_four_hours_ago_ms = (time.time() - 86400) * 1000
+    games_today = 0
+    wins_today = 0
+    for m in pool:
+        if m.get('game_end', 0) >= twenty_four_hours_ago_ms:
+            games_today += 1
+            if m['win']:
+                wins_today += 1
+    
+    # === Auto-tag (priority order, more specific tags override) ===
     tag = None
     
-    # On fire / on tilt
+    # Streak tags
     if streak_type == "win" and streak_count >= 3:
         tag = "ON FIRE"
     elif streak_type == "loss" and streak_count >= 3:
         tag = "ON TILT"
     
+    # Heavy session detection
+    if games_today >= 6:
+        losses_today = games_today - wins_today
+        if losses_today >= 4:
+            tag = "TILTED"  # 6+ games, 4+ losses
+        elif games_today >= 8:
+            tag = "GRINDING"
+    
     # OTP — 7+ games on same champ
     if mains and mains[0]["games"] >= 7:
         tag = f"{mains[0]['champion']} OTP"
     
-    # First time on the champion they're about to play
-    if current_champion and current_champion not in champ_counts:
-        # Only override less specific tags
-        if tag in (None, "ON FIRE", "ON TILT"):
-            tag = "FIRST TIME"
+    # Smurf flag — high winrate on a low-game-count account
+    # We need rank info to do this properly, but as a heuristic:
+    # if they have <30 total games but >65% winrate, flag them
+    if pool and len(pool) <= 20:  # we only have last 20 anyway, so this is approximate
+        wins = sum(1 for m in pool if m['win'])
+        recent_wr = wins / len(pool)
+        if recent_wr >= 0.7 and len(pool) >= 5 and avg_kda_dominant(pool):
+            tag = "SMURF?"
     
-    return {
-        "avg_kda": {
-            "kills": round(avg_kills, 1),
-            "deaths": round(avg_deaths, 1),
-            "assists": round(avg_assists, 1),
-        },
-        "kda_ratio": round(kda_ratio, 2),
-        "avg_cs_per_min": round(avg_cs_per_min, 1),
-        "mains": mains,
-        "streak": {"type": streak_type, "count": streak_count},
-        "tag": tag,
-    }
+    # First time on the champion they're
+
+async def get_account_by_puuid(puuid: str, region: str) -> dict | None:
+    """Look up name#tagline from a puuid. Heavily cached because puuids are stable."""
+    cache_key = f"account:{puuid}:{region}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+    
+    headers = {"X-Riot-Token": API_KEY}
+    url = f"https://{region}.api.riotgames.com/riot/account/v1/accounts/by-puuid/{puuid}"
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=headers)
+    
+    if resp.status_code != 200:
+        return None
+    
+    data = resp.json()
+    result = {"name": data["gameName"], "tagline": data["tagLine"]}
+    cache_set(cache_key, result, ttl_seconds=86400)  # 24h — puuids are stable
+    return result
 
 async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, region: str, queue_id: int = 420):
     # Cache key includes everything that affects the result
@@ -323,6 +367,39 @@ async def get_players(players: list[Player], region: str = "na", queue_id: int =
     calls = [get_player_info_solo(p.name, p.tagline, platform, riot_region, queue_id) for p in players]
     results = await asyncio.gather(*calls)
     return results
+
+def get_loading_screen_players():
+    """Pull both teams from the LCU gameflow session.
+    Returns list of {puuid, team} dicts, or None if not available."""
+    try:
+        port, password = get_lcu_credentials()
+        url = f"https://127.0.0.1:{port}/lol-gameflow/v1/session"
+        response = httpx.get(url, auth=("riot", password), verify=False, timeout=2.0)
+        
+        if response.status_code != 200:
+            return None
+        
+        data = response.json()
+        game_data = data.get('gameData', {})
+        team_one = game_data.get('teamOne', [])
+        team_two = game_data.get('teamTwo', [])
+        queue_id = game_data.get('queue', {}).get('id', 0)
+        
+        # Tag each player with which team they're on
+        players = []
+        for p in team_one:
+            if p.get('puuid'):
+                players.append({"puuid": p['puuid'], "team": "ORDER"})
+        for p in team_two:
+            if p.get('puuid'):
+                players.append({"puuid": p['puuid'], "team": "CHAOS"})
+        
+        if not players:
+            return None
+        
+        return {"players": players, "queue_id": queue_id}
+    except Exception:
+        return None
 
 def get_lcu_region():
     """Detect which region the running League client is on."""
@@ -431,6 +508,8 @@ def get_live_game_data():
 
 @app.get("/champ-select")
 async def champ_select(region: str = None):
+    global _last_champ_select
+    
     if region is None:
         region = get_lcu_region() or "na"
     
@@ -447,42 +526,55 @@ async def champ_select(region: str = None):
     platform, riot_region = region_map[region]
     phase = get_gameflow_phase()
     
+    # === In-game or loading screen ===
     if phase == "InProgress":
         live = get_live_game_data()
         
-        if live is None:
-            cs_result = get_champ_select_players() or _last_champ_select
-            if cs_result:
-                cs_players = cs_result["players"]
-                queue_id = cs_result["queue_id"]
-                calls = [get_player_info_solo(p["name"], p["tagline"], platform, riot_region, queue_id) for p in cs_players]
-                results = await asyncio.gather(*calls)
-                return {
-                    "state": "loading",
-                    "players": results,
-                    "region": region,
-                    "queue_id": queue_id
-                }
-            # No champ-select so just idle
-            return {"state": "loading", "players": [], "region": region}
+        if live is not None and live.get("game_time", 0) > 5.0:
+            return {"state": "in_game", "players": [], "region": region, "game_time": live["game_time"]}
         
-        # Game actually running 
-        return {"state": "in_game", "players": [], "region": region, "game_time": live["game_time"]}
-    
-    if phase == "ChampSelect":
-        cs_result = get_champ_select_players()
-        if cs_result:
-            cs_players = cs_result["players"]
-            queue_id = cs_result["queue_id"]
-            calls = [get_player_info_solo(p["name"], p["tagline"], platform, riot_region, queue_id) for p in cs_players]
+        # Live Client API not up yet => loading screen, replay last champ select roster
+        if _last_champ_select:
+            cs_players = _last_champ_select["players"]
+            queue_id = _last_champ_select["queue_id"]
+            calls = [
+                get_player_info_solo(p["name"], p["tagline"], platform, riot_region, queue_id)
+                for p in cs_players
+            ]
             results = await asyncio.gather(*calls)
             return {
-                "state": "champ_select",
+                "state": "loading",
                 "players": results,
                 "region": region,
-                "queue_id": queue_id
+                "queue_id": queue_id,
             }
+        return {"state": "loading", "players": [], "region": region}
     
+    # === Champ select ===
+    if phase == "ChampSelect":
+        cs_result = get_champ_select_players()
+        if not cs_result:
+            return {"state": "idle", "players": [], "region": region}
+        
+        # Cache the roster so loading screen can replay it
+        _last_champ_select = cs_result
+        
+        cs_players = cs_result["players"]
+        queue_id = cs_result["queue_id"]
+        
+        calls = [
+            get_player_info_solo(p["name"], p["tagline"], platform, riot_region, queue_id)
+            for p in cs_players
+        ]
+        results = await asyncio.gather(*calls)
+        return {
+            "state": "champ_select",
+            "players": results,
+            "region": region,
+            "queue_id": queue_id,
+        }
+    
+    # === Idle (lobby, matchmaking, post-game, none) ===
     return {"state": "idle", "players": [], "region": region}
 
 @app.get("/live-game")

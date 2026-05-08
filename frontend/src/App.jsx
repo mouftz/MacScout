@@ -89,6 +89,14 @@ function App() {
         return () => clearInterval(interval);
     }, [state]);
 
+        const sortedPlayers = [...players].sort((a, b) => {
+    // Find which team the user is on
+    // For now: ORDER first, CHAOS second
+    if (a.team === 'ORDER' && b.team !== 'ORDER') return -1;
+    if (a.team !== 'ORDER' && b.team === 'ORDER') return 1;
+    return 0;
+});
+
     return (
         <div className="cards-container">
             {state === "in_game" ? null : (
