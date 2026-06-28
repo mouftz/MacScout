@@ -2,6 +2,7 @@ from fastapi import FastAPI
 import httpx
 import asyncio
 import os
+import json
 from dotenv import load_dotenv
 load_dotenv()
 from pydantic import BaseModel
@@ -24,6 +25,41 @@ app.add_middleware(
 
 _cache = {}
 _last_champ_select = None
+
+def is_riot_puuid(value: str | None) -> bool:
+    """Riot API PUUIDs are long encrypted strings, not 36-char LCU UUID placeholders."""
+    return bool(value and len(value) >= 60)
+
+def split_riot_id(value: str | None) -> tuple[str | None, str | None]:
+    if not value or "#" not in value:
+        return None, None
+    name, tagline = value.rsplit("#", 1)
+    if not name or not tagline:
+        return None, None
+    return name, tagline
+
+def extract_loading_player(player: dict, team: str) -> dict | None:
+    """Extract the best identity LCU exposes for a loading-screen player."""
+    name = player.get("gameName") or player.get("riotIdGameName")
+    tagline = player.get("tagLine") or player.get("tagline") or player.get("riotIdTagLine")
+    if name and tagline:
+        return {"name": name, "tagline": tagline, "team": team}
+
+    for key in ("riotId", "riotIdName", "summonerName", "displayName"):
+        name, tagline = split_riot_id(player.get(key))
+        if name and tagline:
+            return {"name": name, "tagline": tagline, "team": team}
+
+    for key in ("puuid", "playerPuuid", "riotPuuid", "accountPuuid"):
+        puuid = player.get(key)
+        if is_riot_puuid(puuid):
+            return {"puuid": puuid, "team": team}
+
+    return None
+
+def dump_loading_player_fields(team_one: list, team_two: list) -> None:
+    payload = {"teamOne": team_one, "teamTwo": team_two}
+    print(f"[loading] raw player objects={json.dumps(payload, default=str)}", flush=True)
 
 def cache_get(key):
     """Return cached value if not expired, else None."""
@@ -137,7 +173,18 @@ async def get_recent_matches(puuid: str, region: str, queue_id: int, count: int 
         }
         cache_set(cache_key, result, ttl_seconds=600)
         return result
-    
+
+def avg_kda_dominant(matches: list) -> bool:
+    """Helper for compute_trends"""
+    if not matches:
+        return False
+    avg_k = sum(m['kills'] for m in matches) / len(matches)
+    avg_d = sum(m['deaths'] for m in matches) / len(matches)
+    avg_a = sum(m['assists'] for m in matches) / len(matches)
+    if avg_d == 0:
+        return True
+    return (avg_k + avg_a) / avg_d >= 4.0
+
 def compute_trends(matches: list, all_matches: list = None, current_champion: str = None) -> dict:
     """Get stats and tags from a list of recent match objects."""
     if not matches:
@@ -257,15 +304,20 @@ async def get_account_by_puuid(puuid: str, region: str) -> dict | None:
     headers = {"X-Riot-Token": API_KEY}
     url = f"https://{region}.api.riotgames.com/riot/account/v1/accounts/by-puuid/{puuid}"
     
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, headers=headers)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=headers)
+    except Exception as e:
+        print(f"[account] EXCEPTION for {puuid[:8]}... region={region}: {type(e).__name__}: {e}", flush=True)
+        return None
     
     if resp.status_code != 200:
+        print(f"[account] {resp.status_code} for {puuid[:8]}... region={region} url={url[:80]}", flush=True)
         return None
     
     data = resp.json()
     result = {"name": data["gameName"], "tagline": data["tagLine"]}
-    cache_set(cache_key, result, ttl_seconds=86400)  # 24h — puuids are stable
+    cache_set(cache_key, result, ttl_seconds=86400)  # 24h 
     return result
 
 async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, region: str, queue_id: int = 420):
@@ -377,6 +429,7 @@ def get_loading_screen_players():
         response = httpx.get(url, auth=("riot", password), verify=False, timeout=2.0)
         
         if response.status_code != 200:
+            print(f"[loading] bad status: {response.status_code}", flush=True)
             return None
         
         data = response.json()
@@ -384,21 +437,31 @@ def get_loading_screen_players():
         team_one = game_data.get('teamOne', [])
         team_two = game_data.get('teamTwo', [])
         queue_id = game_data.get('queue', {}).get('id', 0)
+        print(f"[loading] teamOne={len(team_one)} teamTwo={len(team_two)} queue={queue_id} phase={data.get('phase')}", flush=True)
         
-        # Tag each player with which team they're on
         players = []
-        for p in team_one:
-            if p.get('puuid'):
-                players.append({"puuid": p['puuid'], "team": "ORDER"})
-        for p in team_two:
-            if p.get('puuid'):
-                players.append({"puuid": p['puuid'], "team": "CHAOS"})
+        invalid_players = []
+        for team, team_players in (("ORDER", team_one), ("CHAOS", team_two)):
+            for p in team_players:
+                extracted = extract_loading_player(p, team)
+                if extracted:
+                    players.append(extracted)
+                else:
+                    invalid_players.append(p)
         
         if not players:
+            print("[loading] no usable Riot IDs or Riot PUUIDs extracted", flush=True)
+            dump_loading_player_fields(team_one, team_two)
             return None
+
+        if invalid_players:
+            print(f"[loading] skipped {len(invalid_players)} players with no usable Riot identity", flush=True)
+            dump_loading_player_fields(team_one, team_two)
         
+        print(f"[loading] returning {len(players)} players", flush=True)
         return {"players": players, "queue_id": queue_id}
-    except Exception:
+    except Exception as e:
+        print(f"[loading] EXCEPTION: {type(e).__name__}: {e}", flush=True)
         return None
 
 def get_lcu_region():
@@ -533,7 +596,45 @@ async def champ_select(region: str = None):
         if live is not None and live.get("game_time", 0) > 5.0:
             return {"state": "in_game", "players": [], "region": region, "game_time": live["game_time"]}
         
-        # Live Client API not up yet => loading screen, replay last champ select roster
+        # Live Client API not up yet => loading screen
+        # Try to get both teams from LCU gameflow first
+        loading_info = get_loading_screen_players()
+        print(f"[champ_select] loading_info={'present' if loading_info else 'None'}", flush=True)
+        
+        if loading_info:
+            queue_id = loading_info["queue_id"]
+            puuid_players = [p for p in loading_info["players"] if p.get("puuid")]
+            account_calls = [get_account_by_puuid(p["puuid"], riot_region) for p in puuid_players]
+            accounts = await asyncio.gather(*account_calls) if account_calls else []
+            
+            valid_players = [
+                {"name": p["name"], "tagline": p["tagline"], "team": p["team"]}
+                for p in loading_info["players"]
+                if p.get("name") and p.get("tagline")
+            ]
+            for p, acct in zip(puuid_players, accounts):
+                if acct and acct.get("name") and acct.get("tagline"):
+                    valid_players.append({"name": acct["name"], "tagline": acct["tagline"], "team": p["team"]})
+            
+            print(f"[champ_select] resolved {len(valid_players)}/{len(loading_info['players'])} loading identities", flush=True)
+            
+            info_calls = [
+                get_player_info_solo(vp["name"], vp["tagline"], platform, riot_region, queue_id)
+                for vp in valid_players
+            ]
+            results = await asyncio.gather(*info_calls)
+            
+            for r, vp in zip(results, valid_players):
+                r["team"] = vp["team"]
+            
+            return {
+                "state": "loading",
+                "players": results,
+                "region": region,
+                "queue_id": queue_id,
+            }
+        
+        # Fallback: use cached champ select roster
         if _last_champ_select:
             cs_players = _last_champ_select["players"]
             queue_id = _last_champ_select["queue_id"]
@@ -542,6 +643,8 @@ async def champ_select(region: str = None):
                 for p in cs_players
             ]
             results = await asyncio.gather(*calls)
+            for r in results:
+                r["team"] = "ORDER"
             return {
                 "state": "loading",
                 "players": results,

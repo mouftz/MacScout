@@ -4,6 +4,7 @@ import './App.css';
 function PlayerCard({ player }) {
     const matches = player.recent_matches;
     const trends = player.trends;
+    const teamClass = player.team ? `team-${player.team.toLowerCase()}` : '';
     
     const rankClasses = ['player-rank'];
     if (player.rank === 'Unranked' || player.rank === 'Unknown') {
@@ -11,7 +12,7 @@ function PlayerCard({ player }) {
     }
     
     return (
-        <div className="player-card">
+        <div className={`player-card ${teamClass}`}>
             {trends?.tag && (
                 <div className={`tag tag-${trends.tag.toLowerCase().replace(/[^a-z]/g, '-')}`}>
                     {trends.tag}
@@ -89,13 +90,10 @@ function App() {
         return () => clearInterval(interval);
     }, [state]);
 
-        const sortedPlayers = [...players].sort((a, b) => {
-    // Find which team the user is on
-    // For now: ORDER first, CHAOS second
-    if (a.team === 'ORDER' && b.team !== 'ORDER') return -1;
-    if (a.team !== 'ORDER' && b.team === 'ORDER') return 1;
-    return 0;
-});
+    const sortedPlayers = [...players].sort((a, b) => {
+        const teamOrder = { ORDER: 0, CHAOS: 1 };
+        return (teamOrder[a.team] ?? 2) - (teamOrder[b.team] ?? 2);
+    });
 
     return (
         <div className="cards-container">
@@ -106,7 +104,9 @@ function App() {
                         {state === "loading" && "Loading screen"}
                         {state === "champ_select" && "Champ select"}
                     </div>
-                    {players.map((p, i) => <PlayerCard key={i} player={p} />)}
+                    {sortedPlayers.map((p, i) => (
+                        <PlayerCard key={`${p.team || 'player'}-${p.name}-${p.tagline}-${i}`} player={p} />
+                    ))}
                 </>
             )}
         </div>
