@@ -55,11 +55,47 @@ def extract_loading_player(player: dict, team: str) -> dict | None:
         if is_riot_puuid(puuid):
             return {"puuid": puuid, "team": team}
 
+    summoner_id = player.get("summonerId")
+    if summoner_id:
+        return {"summoner_id": summoner_id, "team": team}
+
     return None
 
 def dump_loading_player_fields(team_one: list, team_two: list) -> None:
     payload = {"teamOne": team_one, "teamTwo": team_two}
     print(f"[loading] raw player objects={json.dumps(payload, default=str)}", flush=True)
+
+def get_lcu_summoner_by_id(summoner_id: int) -> dict | None:
+    """Resolve a summonerId through the local League client."""
+    cache_key = f"lcu-summoner:{summoner_id}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        port, password = get_lcu_credentials()
+        url = f"https://127.0.0.1:{port}/lol-summoner/v1/summoners/{summoner_id}"
+        response = httpx.get(url, auth=("riot", password), verify=False, timeout=2.0)
+        if response.status_code != 200:
+            print(f"[lcu-summoner] {response.status_code} for summonerId={summoner_id}", flush=True)
+            return None
+
+        data = response.json()
+        name = data.get("gameName") or data.get("riotIdGameName")
+        tagline = data.get("tagLine") or data.get("riotIdTagLine")
+        if not name or not tagline:
+            riot_id = data.get("displayName") or data.get("gameName")
+            name, tagline = split_riot_id(riot_id)
+        if not name or not tagline:
+            print(f"[lcu-summoner] missing Riot ID for summonerId={summoner_id}", flush=True)
+            return None
+
+        result = {"name": name, "tagline": tagline}
+        cache_set(cache_key, result, ttl_seconds=300)
+        return result
+    except Exception as e:
+        print(f"[lcu-summoner] EXCEPTION for summonerId={summoner_id}: {type(e).__name__}: {e}", flush=True)
+        return None
 
 def cache_get(key):
     """Return cached value if not expired, else None."""
@@ -603,7 +639,9 @@ async def champ_select(region: str = None):
         
         if loading_info:
             queue_id = loading_info["queue_id"]
+            summoner_id_players = [p for p in loading_info["players"] if p.get("summoner_id")]
             puuid_players = [p for p in loading_info["players"] if p.get("puuid")]
+            lcu_accounts = [get_lcu_summoner_by_id(p["summoner_id"]) for p in summoner_id_players]
             account_calls = [get_account_by_puuid(p["puuid"], riot_region) for p in puuid_players]
             accounts = await asyncio.gather(*account_calls) if account_calls else []
             
@@ -612,6 +650,9 @@ async def champ_select(region: str = None):
                 for p in loading_info["players"]
                 if p.get("name") and p.get("tagline")
             ]
+            for p, acct in zip(summoner_id_players, lcu_accounts):
+                if acct and acct.get("name") and acct.get("tagline"):
+                    valid_players.append({"name": acct["name"], "tagline": acct["tagline"], "team": p["team"]})
             for p, acct in zip(puuid_players, accounts):
                 if acct and acct.get("name") and acct.get("tagline"):
                     valid_players.append({"name": acct["name"], "tagline": acct["tagline"], "team": p["team"]})
