@@ -33,6 +33,13 @@ _scout_snapshot = {}
 # attempted once rather than on every poll.
 _scout_attempted = set()
 
+# Single-flight guard for /champ-select. The frontend polls on a timer, and a
+# cold champ select takes seconds under the rate limiter — without this, each
+# poll starts its own full scrape, the limiter queues them all, and the backlog
+# never drains. Overlapping callers get the last good result instead.
+_scrape_lock = asyncio.Lock()
+_last_response = None
+
 # How many recent matches to pull per player. This is the main lever on rate
 # limiting: each match costs one request, and a personal key only affords
 # ~10 requests per player when scouting a full 10-player lobby.
@@ -55,23 +62,40 @@ class RiotRateLimiter:
     def __init__(self):
         self._lock = asyncio.Lock()
         self._sent = deque()
+        self._cooldown_until = 0.0
+
+    def penalize(self, retry_after: float):
+        """Riot said 429. The quota is per-key, so pause every caller.
+
+        Without this each in-flight request retries independently and they all
+        slam the API again the moment its own sleep ends, re-triggering the
+        penalty.
+        """
+        until = time.monotonic() + retry_after
+        if until > self._cooldown_until:
+            self._cooldown_until = until
+            print(f"[ratelimit] global cooldown {retry_after:.0f}s", flush=True)
 
     async def acquire(self):
         while True:
             async with self._lock:
                 now = time.monotonic()
-                while self._sent and now - self._sent[0] > self.WINDOW:
-                    self._sent.popleft()
 
-                in_last_second = sum(1 for t in self._sent if now - t < 1.0)
-                if len(self._sent) < self.PER_WINDOW and in_last_second < self.PER_SECOND:
-                    self._sent.append(now)
-                    return
-
-                if in_last_second >= self.PER_SECOND:
-                    wait = 1.0 - (now - self._sent[-self.PER_SECOND])
+                if now < self._cooldown_until:
+                    wait = self._cooldown_until - now
                 else:
-                    wait = self.WINDOW - (now - self._sent[0])
+                    while self._sent and now - self._sent[0] > self.WINDOW:
+                        self._sent.popleft()
+
+                    in_last_second = sum(1 for t in self._sent if now - t < 1.0)
+                    if len(self._sent) < self.PER_WINDOW and in_last_second < self.PER_SECOND:
+                        self._sent.append(now)
+                        return
+
+                    if in_last_second >= self.PER_SECOND:
+                        wait = 1.0 - (now - self._sent[-self.PER_SECOND])
+                    else:
+                        wait = self.WINDOW - (now - self._sent[0])
 
             await asyncio.sleep(max(0.05, min(wait, 5.0)))
 
@@ -89,8 +113,9 @@ async def riot_get(client, url, headers=None, max_retries=2):
         if resp.status_code != 429 or attempt == max_retries:
             return resp
         retry_after = float(resp.headers.get("Retry-After", "1") or 1)
-        print(f"[ratelimit] 429 on {url[:60]}..., waiting {retry_after}s", flush=True)
-        await asyncio.sleep(retry_after + 0.1)
+        _limiter.penalize(retry_after)
+        # No per-request sleep: acquire() now blocks on the shared cooldown, so
+        # every caller resumes together instead of stampeding.
     return resp
 
 async def get_champion_map() -> dict:
@@ -200,6 +225,52 @@ def get_lcu_summoner_by_id(summoner_id: int) -> dict | None:
         print(f"[lcu-summoner] EXCEPTION for summonerId={summoner_id}: {type(e).__name__}: {e}", flush=True)
         return None
 
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".macscout_cache.json")
+_last_flush = 0.0
+
+
+def load_cache():
+    """Restore the cache from disk, dropping anything already expired.
+
+    A personal key affords ~100 requests per 2 minutes and scouting a full
+    lobby costs ~90, so re-scraping after every restart reliably exhausts the
+    quota. Surviving a restart is the difference between working and 429ing.
+    """
+    try:
+        with open(CACHE_FILE) as f:
+            stored = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+
+    now = time.time()
+    kept = 0
+    for key, entry in stored.items():
+        try:
+            value, expiry = entry
+        except (TypeError, ValueError):
+            continue
+        if expiry > now:
+            _cache[key] = (value, expiry)
+            kept += 1
+    print(f"[cache] restored {kept} live entries from disk", flush=True)
+
+
+def flush_cache(force=False):
+    """Persist the cache, at most every few seconds to avoid churning the disk."""
+    global _last_flush
+    now = time.time()
+    if not force and now - _last_flush < 5.0:
+        return
+    _last_flush = now
+    try:
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_cache, f)
+        os.replace(tmp, CACHE_FILE)  # atomic, so a crash cannot truncate it
+    except Exception as e:
+        print(f"[cache] flush failed: {type(e).__name__}: {e}", flush=True)
+
+
 def cache_get(key):
     """Return cached value if not expired, else None."""
     if key in _cache:
@@ -213,6 +284,10 @@ def cache_get(key):
 def cache_set(key, value, ttl_seconds):
     """Store value in cache with expiry."""
     _cache[key] = (value, time.time() + ttl_seconds)
+    flush_cache()
+
+
+load_cache()
 
 @app.get("/")
 def root():
@@ -492,18 +567,34 @@ async def get_account_by_puuid(puuid: str, region: str) -> dict | None:
     cache_set(cache_key, result, ttl_seconds=86400)  # 24h 
     return result
 
+def retag_for_champion(result: dict, current_champion: str | None) -> dict:
+    """Recompute a cached player's tag for the champion they are on.
+
+    Pure — reuses the matches already fetched, so switching champions costs
+    no API calls.
+    """
+    if not current_champion:
+        return result
+    matches = result.get("recent_matches") or {}
+    trends = compute_trends(
+        matches.get("matches", []),
+        all_matches=matches.get("all_matches", []),
+    )
+    return {**result, "trends": trends}
+
+
 async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, region: str, queue_id: int = 420,
                                current_champion: str | None = None):
-    # Cache key includes everything that affects the result. current_champion
-    # changes the tag, so it belongs here — the underlying match fetch is cached
-    # separately, so a champion swap recomputes tags without new API calls.
-    cache_key = f"player:{summoner_name}:{tagline}:{region}:{queue_id}:{current_champion or '-'}"
-    
-    # Check cache first
+    # current_champion is deliberately NOT in the cache key. It only affects the
+    # tag, which is a pure function of already-fetched matches — keying on it
+    # meant every hover and lock-in during champ select invalidated the entry
+    # and re-fetched the whole player.
+    cache_key = f"player:{summoner_name}:{tagline}:{region}:{queue_id}"
+
     cached = cache_get(cache_key)
     if cached is not None:
-        return cached
-    
+        return retag_for_champion(cached, current_champion)
+
     async with httpx.AsyncClient() as client:
         puuidurl = f"https://{region}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{summoner_name}/{tagline}"
         puuidraw = await riot_get(client, puuidurl)
@@ -535,10 +626,10 @@ async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, 
 
     if not stats or not solo_entries:
         matches = await get_recent_matches(puuid, region, queue_id)
+        # Cache the champion-agnostic result; retag on the way out.
         trends = compute_trends(
-        matches.get("matches", []),
-        all_matches=matches.get("all_matches", []),
-        current_champion=current_champion,
+            matches.get("matches", []),
+            all_matches=matches.get("all_matches", []),
         )
         result = {
             'name': summoner_name, 'tagline': tagline, 'rank': 'Unranked',
@@ -547,7 +638,7 @@ async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, 
             'trends': trends,
         }
         cache_set(cache_key, result, ttl_seconds=300)
-        return result
+        return retag_for_champion(result, current_champion)
     
     solo_duo = solo_entries[0]
     rank = str(solo_duo['tier']) + ' ' + str(solo_duo['rank'])
@@ -559,7 +650,6 @@ async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, 
     trends = compute_trends(
         matches.get("matches", []),
         all_matches=matches.get("all_matches", []),
-        current_champion=current_champion,
     )
 
 
@@ -575,7 +665,7 @@ async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, 
         'trends': trends
     }
     cache_set(cache_key, result, ttl_seconds=300)  # note thats its 5 mins
-    return result
+    return retag_for_champion(result, current_champion)
 
 class Player(BaseModel):
     name: str
@@ -762,8 +852,25 @@ def get_live_game_data():
 
 @app.get("/champ-select")
 async def champ_select(region: str = None):
+    global _last_response
+    # One scrape at a time. Callers that arrive mid-scrape wait for it and get
+    # its result — returning a placeholder here would flash "Waiting…" in the
+    # overlay even though a perfectly good scrape was already running.
+    was_locked = _scrape_lock.locked()
+    async with _scrape_lock:
+        if was_locked and _last_response is not None:
+            return _last_response
+        _last_response = await _champ_select_inner(region)
+        # Force a write: cache_set debounces, so without this the entries
+        # created in the last few seconds of a scrape never reach disk — and
+        # those are exactly the ones a restart needs.
+        flush_cache(force=True)
+        return _last_response
+
+
+async def _champ_select_inner(region: str = None):
     global _last_champ_select
-    
+
     if region is None:
         region = get_lcu_region() or "na"
     

@@ -7,4 +7,4 @@ dist/
 .vite/
 .DS_Store
 .vscode/
-.idea/
+.idea/.macscout_cache.json
