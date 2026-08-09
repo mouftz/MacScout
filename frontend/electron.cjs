@@ -26,7 +26,12 @@ function createWindow() {
     });
 
     win.loadURL('http://localhost:5174');
-    win.webContents.openDevTools({ mode: 'detach' });
+
+    // Opt-in only: a detached DevTools window on top of the game is not what
+    // you want while playing. Run with MACSCOUT_DEVTOOLS=1 to debug.
+    if (process.env.MACSCOUT_DEVTOOLS === '1') {
+        win.webContents.openDevTools({ mode: 'detach' });
+    }
 
     // Make the window click-through everywhere
     win.setIgnoreMouseEvents(true, { forward: true });
