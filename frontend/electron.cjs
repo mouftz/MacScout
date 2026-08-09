@@ -1,4 +1,5 @@
 const { app, BrowserWindow, globalShortcut, screen } = require('electron');
+const { exec } = require('child_process');
 
 // Set app name early — affects macOS menu bar, dock, About panel, etc.
 app.setName('MacScout');
@@ -19,6 +20,10 @@ function createWindow() {
         alwaysOnTop: true,
         resizable: true,
         hasShadow: false,
+        // Set here, not via setFullScreenable() later, which would clobber
+        // the collectionBehavior that setVisibleOnAllWorkspaces depends on.
+        fullscreenable: false,
+        skipTaskbar: true,
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
@@ -35,17 +40,41 @@ function createWindow() {
 
     // Make the window click-through everywhere
     win.setIgnoreMouseEvents(true, { forward: true });
-    
-    // Keep visible when League goes fullscreen on macOS.
+
+    // Order matters on macOS. Both setAlwaysOnTop and setFullScreenable
+    // rewrite the window's collectionBehavior, which clears the
+    // canJoinAllSpaces / fullScreenAuxiliary flags that setVisibleOnAllWorkspaces
+    // sets — so that call has to come LAST or the overlay stops drawing over
+    // borderless League. (fullscreenable is set in the constructor above.)
     //
-    // `alwaysOnTop: true` alone uses the 'floating' window level, which sits
-    // above normal windows but *below* a fullscreen app — so the overlay would
-    // vanish the moment the game starts. 'screen-saver' is the highest
-    // practical level and is what actually floats above fullscreen.
+    // 'screen-saver' is the highest practical window level; plain
+    // `alwaysOnTop: true` uses 'floating', which sits below a fullscreen app.
     win.setAlwaysOnTop(true, 'screen-saver');
     win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-    // Stop the overlay itself from being pulled into its own fullscreen Space.
-    win.setFullScreenable(false);
+
+    watchFrontmostApp();
+}
+
+// --- Hide the overlay when League isn't the app you're looking at ----------
+// The window is always-on-top at screen-saver level, so without this it floats
+// over Discord, the browser, everything. lsappinfo needs no accessibility
+// permission, unlike the System Events AppleScript route.
+let manuallyHidden = false;
+
+function watchFrontmostApp() {
+    setInterval(() => {
+        if (!win || win.isDestroyed() || manuallyHidden) return;
+
+        exec('lsappinfo info -only name "$(lsappinfo front)"', (err, stdout) => {
+            if (err) return;
+            const isLeague = /league/i.test(stdout);
+            if (isLeague && !win.isVisible()) {
+                win.showInactive();  // never steal focus from the game
+            } else if (!isLeague && win.isVisible()) {
+                win.hide();
+            }
+        });
+    }, 1000);
 }
 
 app.whenReady().then(() => {
@@ -53,8 +82,13 @@ app.whenReady().then(() => {
 
     // Cmd+Shift+H -> toggle visibility
     globalShortcut.register('CommandOrControl+Shift+H', () => {
-        if (win.isVisible()) win.hide();
-        else win.show();
+        if (win.isVisible()) {
+            manuallyHidden = true;   // keep it hidden even while League is focused
+            win.hide();
+        } else {
+            manuallyHidden = false;
+            win.showInactive();
+        }
     });
 
     // Cmd+Shift+C -> collapse to a small pill / expand again.
