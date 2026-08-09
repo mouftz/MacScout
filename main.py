@@ -328,7 +328,21 @@ def compute_trends(matches: list, all_matches: list = None, current_champion: st
         if recent_wr >= 0.7 and len(pool) >= 5 and avg_kda_dominant(pool):
             tag = "SMURF?"
     
-    # First time on the champion they're
+    return {
+        "avg_kda": {
+            "kills": round(avg_kills, 1),
+            "deaths": round(avg_deaths, 1),
+            "assists": round(avg_assists, 1),
+        },
+        "kda_ratio": round(kda_ratio, 2),
+        "avg_cs_per_min": round(avg_cs_per_min, 1),
+        "mains": mains,
+        "streak": {"type": streak_type, "count": streak_count},
+        "main_role": main_role,
+        "games_today": games_today,
+        "wins_today": wins_today,
+        "tag": tag,
+    }
 
 async def get_account_by_puuid(puuid: str, region: str) -> dict | None:
     """Look up name#tagline from a puuid. Heavily cached because puuids are stable."""
