@@ -8,6 +8,7 @@ load_dotenv()
 from pydantic import BaseModel
 import urllib3
 import time
+from collections import deque
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 API_KEY = os.getenv("RIOT_API_KEY")
@@ -25,6 +26,66 @@ app.add_middleware(
 
 _cache = {}
 _last_champ_select = None
+
+# How many recent matches to pull per player. This is the main lever on rate
+# limiting: each match costs one request, and a personal key only affords
+# ~10 requests per player when scouting a full 10-player lobby.
+MATCH_COUNT = 6
+
+
+class RiotRateLimiter:
+    """Shared token bucket for the Riot API.
+
+    Personal keys allow 20 requests/second and 100 per 2 minutes, applied
+    across every endpoint. Scouting 10 players bursts well past both, so all
+    Riot calls funnel through here and wait their turn instead of 429ing.
+    Limits are set slightly under the real ones to leave room for retries.
+    """
+
+    PER_SECOND = 18
+    PER_WINDOW = 95
+    WINDOW = 120.0
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._sent = deque()
+
+    async def acquire(self):
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                while self._sent and now - self._sent[0] > self.WINDOW:
+                    self._sent.popleft()
+
+                in_last_second = sum(1 for t in self._sent if now - t < 1.0)
+                if len(self._sent) < self.PER_WINDOW and in_last_second < self.PER_SECOND:
+                    self._sent.append(now)
+                    return
+
+                if in_last_second >= self.PER_SECOND:
+                    wait = 1.0 - (now - self._sent[-self.PER_SECOND])
+                else:
+                    wait = self.WINDOW - (now - self._sent[0])
+
+            await asyncio.sleep(max(0.05, min(wait, 5.0)))
+
+
+_limiter = RiotRateLimiter()
+
+
+async def riot_get(client, url, headers=None, max_retries=2):
+    """GET a Riot API endpoint through the rate limiter, retrying on 429."""
+    headers = headers or {"X-Riot-Token": API_KEY}
+    resp = None
+    for attempt in range(max_retries + 1):
+        await _limiter.acquire()
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 429 or attempt == max_retries:
+            return resp
+        retry_after = float(resp.headers.get("Retry-After", "1") or 1)
+        print(f"[ratelimit] 429 on {url[:60]}..., waiting {retry_after}s", flush=True)
+        await asyncio.sleep(retry_after + 0.1)
+    return resp
 
 def is_riot_puuid(value: str | None) -> bool:
     """Riot API PUUIDs are long encrypted strings, not 36-char LCU UUID placeholders."""
@@ -115,60 +176,56 @@ def cache_set(key, value, ttl_seconds):
 def root():
     return {"message": "server is running"}
 
-async def get_recent_matches(puuid: str, region: str, queue_id: int, count: int = 10):
-    """Fetch recent matches. Returns:
-       - results/winrate from the current queue (for dots + streak)
-       - all_matches: broader pool across queues (for mains + KDA averages)
+async def get_recent_matches(puuid: str, region: str, queue_id: int, count: int = MATCH_COUNT):
+    """Fetch recent matches for the current queue (falling back to all queues).
+
+    One id request plus `count` detail requests. Keeping this lean matters:
+    a full lobby multiplies whatever we spend here by ten.
     """
     cache_key = f"matches:{puuid}:{region}:{queue_id}"
     cached = cache_get(cache_key)
     if cached is not None:
         return cached
-    
-    headers = {"X-Riot-Token": API_KEY}
-    
+
+    empty = {"results": [], "winrate": 0.0, "matches": [], "all_matches": []}
+    ids_base = f"https://{region}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids"
+
     async with httpx.AsyncClient() as client:
         valid_queues = {420, 440, 400, 450}
-        
-        # Build two URLs: one queue-filtered (recent dots), one unfiltered (broader pool)
+
+        all_ids = []
         if queue_id in valid_queues:
-            queue_ids_url = f"https://{region}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queue_id}&count={count}"
-        else:
-            queue_ids_url = f"https://{region}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?count={count}"
-        
-        broad_ids_url = f"https://{region}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?count=20"
-        
-        # Fetch both in parallel
-        queue_ids_resp, broad_ids_resp = await asyncio.gather(
-            client.get(queue_ids_url, headers=headers),
-            client.get(broad_ids_url, headers=headers),
-        )
-        
-        if queue_ids_resp.status_code != 200 or broad_ids_resp.status_code != 200:
-            empty = {"results": [], "winrate": 0.0, "matches": [], "all_matches": []}
-            return empty
-        
-        queue_ids = queue_ids_resp.json()
-        broad_ids = broad_ids_resp.json()
-        
-        # De-dupe: queue-filtered IDs are a subset of broad IDs, so we just fetch the union
-        all_ids = list(dict.fromkeys(queue_ids + broad_ids))  # preserves order, removes dupes
-        
+            resp = await riot_get(client, f"{ids_base}?queue={queue_id}&count={count}")
+            if resp.status_code != 200:
+                print(f"[matches] id-fetch failed for {puuid[:8]}...: {resp.status_code}", flush=True)
+                return empty
+            all_ids = resp.json()
+
+        # Nothing in this queue (or an unranked/rotating mode): widen to any queue
+        # so brand-new-to-the-mode players still show something.
         if not all_ids:
-            empty = {"results": [], "winrate": 0.0, "matches": [], "all_matches": []}
+            resp = await riot_get(client, f"{ids_base}?count={count}")
+            if resp.status_code != 200:
+                print(f"[matches] broad id-fetch failed for {puuid[:8]}...: {resp.status_code}", flush=True)
+                return empty
+            all_ids = resp.json()
+
+        if not all_ids:
             cache_set(cache_key, empty, ttl_seconds=600)
             return empty
-        
+
         match_calls = [
-            client.get(f"https://{region}.api.riotgames.com/lol/match/v5/matches/{match_id}", headers=headers)
+            riot_get(client, f"https://{region}.api.riotgames.com/lol/match/v5/matches/{match_id}")
             for match_id in all_ids
         ]
         match_responses = await asyncio.gather(*match_calls)
         
         # Build a lookup: match_id -> parsed match dict
         match_data_by_id = {}
+        failed_codes = {}
         for match_id, resp in zip(all_ids, match_responses):
             if resp.status_code != 200:
+                failed_codes[resp.status_code] = failed_codes.get(resp.status_code, 0) + 1
                 continue
             data = resp.json()
             if 'info' not in data:
@@ -192,20 +249,25 @@ async def get_recent_matches(puuid: str, region: str, queue_id: int, count: int 
                 "queue_id": data['info'].get('queueId', 0),
             }
         
-        # Build queue-filtered list (recent in current queue)
-        matches = [match_data_by_id[mid] for mid in queue_ids if mid in match_data_by_id]
-        # Build broad list (all queues, for mains/averages)
-        all_matches = [match_data_by_id[mid] for mid in broad_ids if mid in match_data_by_id]
-        
+        if failed_codes:
+            print(
+                f"[matches] {puuid[:8]}...: {len(match_data_by_id)}/{len(all_ids)} match fetches ok, "
+                f"failures={failed_codes}",
+                flush=True,
+            )
+
+        # Newest-first, matching the order Riot returned the ids in
+        matches = [match_data_by_id[mid] for mid in all_ids if mid in match_data_by_id]
+
         results = [m['win'] for m in matches]
         wins = sum(1 for r in results if r)
         winrate = round((wins / len(results)) * 100, 1) if results else 0.0
-        
+
         result = {
             "results": results,
             "winrate": winrate,
-            "matches": matches,        # queue-filtered, for dots/streak
-            "all_matches": all_matches  # broader, for mains/averages
+            "matches": matches,
+            "all_matches": matches,  # single pool now; kept for response-shape compat
         }
         cache_set(cache_key, result, ttl_seconds=600)
         return result
@@ -351,12 +413,11 @@ async def get_account_by_puuid(puuid: str, region: str) -> dict | None:
     if cached is not None:
         return cached
     
-    headers = {"X-Riot-Token": API_KEY}
     url = f"https://{region}.api.riotgames.com/riot/account/v1/accounts/by-puuid/{puuid}"
-    
+
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, headers=headers)
+            resp = await riot_get(client, url)
     except Exception as e:
         print(f"[account] EXCEPTION for {puuid[:8]}... region={region}: {type(e).__name__}: {e}", flush=True)
         return None
@@ -379,11 +440,9 @@ async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, 
     if cached is not None:
         return cached
     
-    headers = {"X-Riot-Token": API_KEY}
-    
     async with httpx.AsyncClient() as client:
         puuidurl = f"https://{region}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{summoner_name}/{tagline}"
-        puuidraw = await client.get(puuidurl, headers=headers)
+        puuidraw = await riot_get(client, puuidurl)
         
         if puuidraw.status_code != 200:
             unknown = {
@@ -396,7 +455,7 @@ async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, 
         puuid = puuidraw.json()['puuid']
         
         statsurl = f"https://{platform}.api.riotgames.com/lol/league/v4/entries/by-puuid/{puuid}"
-        statsraw = await client.get(statsurl, headers=headers)
+        statsraw = await riot_get(client, statsurl)
         
         if statsraw.status_code != 200:
             unknown = {
