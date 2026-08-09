@@ -229,8 +229,26 @@ body {
     color: #cbd5e1;
 }
 
+/* Locking a champion they have not played recently — the tag worth reacting to. */
 .tag-first-time {
     background: #d97706;
+}
+
+.tag-otp {
+    background: linear-gradient(135deg, #7c3aed, #a855f7);
+}
+
+.tag-smurf {
+    background: linear-gradient(135deg, #0891b2, #06b6d4);
+}
+
+.tag-tilted {
+    background: linear-gradient(135deg, #1e3a8a, #3730a3);
+    color: #cbd5e1;
+}
+
+.tag-grinding {
+    background: #52525b;
 }
 
 /* OTP tags use generic styling but we adjust the player card to make room for the pill */

@@ -87,6 +87,42 @@ async def riot_get(client, url, headers=None, max_retries=2):
         await asyncio.sleep(retry_after + 0.1)
     return resp
 
+async def get_champion_map() -> dict:
+    """Map numeric champion ids to names, via Data Dragon.
+
+    Data Dragon is a static CDN, not the rate-limited Riot API, so it does not
+    go through riot_get. Its champion `id` strings ("Chogath") match the
+    championName field in match data, so tags compare cleanly.
+    """
+    cached = cache_get("champion-map")
+    if cached is not None:
+        return cached
+
+    try:
+        async with httpx.AsyncClient() as client:
+            versions = await client.get("https://ddragon.leagueoflegends.com/api/versions.json", timeout=5.0)
+            if versions.status_code != 200:
+                print(f"[ddragon] versions {versions.status_code}", flush=True)
+                return {}
+            version = versions.json()[0]
+
+            champs = await client.get(
+                f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/champion.json",
+                timeout=5.0,
+            )
+            if champs.status_code != 200:
+                print(f"[ddragon] champion.json {champs.status_code}", flush=True)
+                return {}
+
+        mapping = {int(c["key"]): c["id"] for c in champs.json()["data"].values()}
+        cache_set("champion-map", mapping, ttl_seconds=86400)
+        print(f"[ddragon] loaded {len(mapping)} champions (patch {version})", flush=True)
+        return mapping
+    except Exception as e:
+        print(f"[ddragon] EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        return {}
+
+
 def is_riot_puuid(value: str | None) -> bool:
     """Riot API PUUIDs are long encrypted strings, not 36-char LCU UUID placeholders."""
     return bool(value and len(value) >= 60)
@@ -296,6 +332,7 @@ def compute_trends(matches: list, all_matches: list = None, current_champion: st
             "games_today": 0,
             "wins_today": 0,
             "tag": None,
+            "tag_kind": None,
         }
     
     # Use broader pool for averages/mains/role when available
@@ -361,35 +398,52 @@ def compute_trends(matches: list, all_matches: list = None, current_champion: st
                 wins_today += 1
     
     # === Auto-tag (priority order, more specific tags override) ===
+    # Thresholds scale with the pool so they stay reachable: we only fetch
+    # MATCH_COUNT games, and a hardcoded "7 games on one champ" can never fire
+    # against a 6-game pool.
+    heavy_session = max(4, round(MATCH_COUNT * 0.8))
+    otp_games = max(3, round(MATCH_COUNT * 0.8))
+    # tag is display text; tag_kind is a stable slug for styling, so the
+    # frontend never has to slugify champion names into CSS classes.
     tag = None
-    
+    tag_kind = None
+
     # Streak tags
     if streak_type == "win" and streak_count >= 3:
-        tag = "ON FIRE"
+        tag, tag_kind = "ON FIRE", "on-fire"
     elif streak_type == "loss" and streak_count >= 3:
-        tag = "ON TILT"
-    
+        tag, tag_kind = "ON TILT", "on-tilt"
+
     # Heavy session detection
-    if games_today >= 6:
+    if games_today >= heavy_session:
         losses_today = games_today - wins_today
-        if losses_today >= 4:
-            tag = "TILTED"  # 6+ games, 4+ losses
-        elif games_today >= 8:
-            tag = "GRINDING"
-    
-    # OTP — 7+ games on same champ
-    if mains and mains[0]["games"] >= 7:
-        tag = f"{mains[0]['champion']} OTP"
-    
-    # Smurf flag — high winrate on a low-game-count account
-    # We need rank info to do this properly, but as a heuristic:
-    # if they have <30 total games but >65% winrate, flag them
-    if pool and len(pool) <= 20:  # we only have last 20 anyway, so this is approximate
+        if losses_today >= max(3, round(heavy_session * 0.7)):
+            tag, tag_kind = "TILTED", "tilted"
+        elif games_today >= MATCH_COUNT:
+            tag, tag_kind = "GRINDING", "grinding"
+
+    # OTP — most of their recent games on one champ
+    if mains and mains[0]["games"] >= otp_games:
+        tag, tag_kind = f"{mains[0]['champion']} OTP", "otp"
+
+    # Smurf flag — high winrate with dominant KDA on a small sample
+    if pool:
         wins = sum(1 for m in pool if m['win'])
         recent_wr = wins / len(pool)
         if recent_wr >= 0.7 and len(pool) >= 5 and avg_kda_dominant(pool):
-            tag = "SMURF?"
-    
+            tag, tag_kind = "SMURF?", "smurf"
+
+    # What they're locking in this game beats any general-purpose tag: it is
+    # the one signal you can still act on during champ select.
+    if current_champion:
+        champ_games = sum(1 for m in pool if m['champion'] == current_champion)
+        if champ_games >= otp_games:
+            tag, tag_kind = f"{current_champion} OTP", "otp"
+        elif champ_games == 0:
+            # Only says it is absent from their last MATCH_COUNT games, not that
+            # they have never played it — hence the question mark.
+            tag, tag_kind = f"1ST TIME {current_champion}?", "first-time"
+
     return {
         "avg_kda": {
             "kills": round(avg_kills, 1),
@@ -404,6 +458,7 @@ def compute_trends(matches: list, all_matches: list = None, current_champion: st
         "games_today": games_today,
         "wins_today": wins_today,
         "tag": tag,
+        "tag_kind": tag_kind,
     }
 
 async def get_account_by_puuid(puuid: str, region: str) -> dict | None:
@@ -431,9 +486,12 @@ async def get_account_by_puuid(puuid: str, region: str) -> dict | None:
     cache_set(cache_key, result, ttl_seconds=86400)  # 24h 
     return result
 
-async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, region: str, queue_id: int = 420):
-    # Cache key includes everything that affects the result
-    cache_key = f"player:{summoner_name}:{tagline}:{region}:{queue_id}"
+async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, region: str, queue_id: int = 420,
+                               current_champion: str | None = None):
+    # Cache key includes everything that affects the result. current_champion
+    # changes the tag, so it belongs here — the underlying match fetch is cached
+    # separately, so a champion swap recomputes tags without new API calls.
+    cache_key = f"player:{summoner_name}:{tagline}:{region}:{queue_id}:{current_champion or '-'}"
     
     # Check cache first
     cached = cache_get(cache_key)
@@ -474,7 +532,7 @@ async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, 
         trends = compute_trends(
         matches.get("matches", []),
         all_matches=matches.get("all_matches", []),
-        current_champion=None
+        current_champion=current_champion,
         )
         result = {
             'name': summoner_name, 'tagline': tagline, 'rank': 'Unranked',
@@ -495,7 +553,7 @@ async def get_player_info_solo(summoner_name: str, tagline: str, platform: str, 
     trends = compute_trends(
         matches.get("matches", []),
         all_matches=matches.get("all_matches", []),
-        current_champion=None
+        current_champion=current_champion,
     )
 
 
@@ -623,8 +681,14 @@ def get_champ_select_players():
         players = data['myTeam'] + data['theirTeam']
         queue_id = data.get('queueId', 0)
         
+        # championId is 0 until they lock in; championPickIntent shows the
+        # hover, which is what you actually want to react to during the pick.
         player_list = [
-            {"name": p['gameName'], "tagline": p['tagLine']}
+            {
+                "name": p['gameName'],
+                "tagline": p['tagLine'],
+                "champion_id": p.get('championId') or p.get('championPickIntent') or 0,
+            }
             for p in players if p['gameName']
         ]
         
@@ -778,12 +842,21 @@ async def champ_select(region: str = None):
         
         cs_players = cs_result["players"]
         queue_id = cs_result["queue_id"]
-        
+
+        champion_map = await get_champion_map()
+        for p in cs_players:
+            p["champion"] = champion_map.get(p.get("champion_id") or 0)
+
         calls = [
-            get_player_info_solo(p["name"], p["tagline"], platform, riot_region, queue_id)
+            get_player_info_solo(
+                p["name"], p["tagline"], platform, riot_region, queue_id,
+                current_champion=p.get("champion"),
+            )
             for p in cs_players
         ]
         results = await asyncio.gather(*calls)
+        for r, p in zip(results, cs_players):
+            r["champion"] = p.get("champion")
         return {
             "state": "champ_select",
             "players": results,

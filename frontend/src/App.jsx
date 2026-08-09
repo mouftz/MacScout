@@ -14,7 +14,7 @@ function PlayerCard({ player }) {
     return (
         <div className={`player-card ${teamClass}`}>
             {trends?.tag && (
-                <div className={`tag tag-${trends.tag.toLowerCase().replace(/[^a-z]/g, '-')}`}>
+                <div className={`tag tag-${trends.tag_kind || 'generic'}`}>
                     {trends.tag}
                 </div>
             )}
