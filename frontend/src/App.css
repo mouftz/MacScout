@@ -199,6 +199,12 @@ body {
 }
 
 /* === Tag pill === */
+/* The badge straddles the card's top edge, so tagged cards need room for it
+   or it lands on top of the player name. */
+.player-card:has(.tag) {
+    padding-top: 28px;
+}
+
 .tag {
     position: absolute;
     top: -6px;
