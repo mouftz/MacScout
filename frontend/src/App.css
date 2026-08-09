@@ -122,40 +122,6 @@ body {
     color: #71717a;
 }
 
-/* === Live in-game stats === */
-.live-stats {
-    margin-top: 4px;
-    padding-top: 6px;
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-}
-
-.live-champ {
-    font-size: 11px;
-    color: #d4d4d8;
-    font-weight: 500;
-}
-
-.live-champ .level {
-    color: #71717a;
-    font-weight: 400;
-}
-
-.live-kda {
-    font-size: 12px;
-    font-weight: 600;
-    color: #fafafa;
-    font-variant-numeric: tabular-nums;
-}
-
-.respawn-timer {
-    font-size: 10px;
-    color: #ef4444;
-    font-weight: 500;
-}
-
 /* === Trends section === */
 .trends-section {
     margin-top: 4px;
@@ -251,7 +217,116 @@ body {
     background: #52525b;
 }
 
+/* Fallback when the backend sends a tag with no known kind. */
+.tag-generic {
+    background: #3f3f46;
+}
+
 /* OTP tags use generic styling but we adjust the player card to make room for the pill */
 .player-card {
     position: relative; /* required for absolute-positioned tag pill */
+}
+
+/* === In-game overlay ===
+   Sits on top of live gameplay, so it stays deliberately lighter than the
+   loading-screen cards: translucent surfaces, small type, no solid panel. */
+.ingame-overlay {
+    padding: 6px 8px;
+    pointer-events: none;
+}
+
+.live-clock {
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: rgba(228, 228, 231, 0.55);
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+    margin-bottom: 4px;
+}
+
+.live-teams {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+}
+
+.live-team {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.live-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: nowrap;
+    /* Translucent so the game reads through, with a shadow to keep text
+       legible over bright terrain. */
+    background: rgba(9, 9, 11, 0.55);
+    border-left: 2px solid transparent;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+}
+
+.live-team-order .live-row {
+    border-left-color: #3b82f6;
+}
+
+.live-team-chaos .live-row {
+    border-left-color: #ef4444;
+}
+
+.live-row.dead {
+    opacity: 0.45;
+}
+
+.live-champ {
+    font-weight: 600;
+    color: #fafafa;
+    min-width: 68px;
+}
+
+.live-level {
+    color: #a1a1aa;
+    font-variant-numeric: tabular-nums;
+    min-width: 14px;
+    text-align: right;
+}
+
+.live-kda {
+    color: #e4e4e7;
+    font-variant-numeric: tabular-nums;
+    min-width: 52px;
+}
+
+.live-cs {
+    color: #a1a1aa;
+    font-variant-numeric: tabular-nums;
+    min-width: 46px;
+}
+
+.live-rank {
+    color: #d4a017;
+    font-size: 10px;
+}
+
+/* No background here: the tag-* colour classes have equal specificity and
+   would lose to it, since this rule comes later in the file. */
+.live-tag {
+    padding: 0 5px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #fafafa;
+    text-shadow: none;
+}
+
+.live-respawn {
+    color: #f87171;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
 }

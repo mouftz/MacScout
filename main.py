@@ -26,6 +26,9 @@ app.add_middleware(
 
 _cache = {}
 _last_champ_select = None
+# Scouting results captured pre-game, keyed "name#tagline". The in-game view
+# reads from this instead of re-querying Riot, so a long game costs no quota.
+_scout_snapshot = {}
 
 # How many recent matches to pull per player. This is the main lever on rate
 # limiting: each match costs one request, and a personal key only affords
@@ -767,7 +770,37 @@ async def champ_select(region: str = None):
         live = get_live_game_data()
         
         if live is not None and live.get("game_time", 0) > 5.0:
-            return {"state": "in_game", "players": [], "region": region, "game_time": live["game_time"]}
+            # Merge live stats with the scouting snapshot taken at the loading
+            # screen. Deliberately no Riot API calls here: the Live Client API
+            # is local and unmetered, and a 25-minute game polling every few
+            # seconds would otherwise burn the rate limit for nothing.
+            players = []
+            for riot_id, lp in live.get("players", {}).items():
+                scouted = _scout_snapshot.get(riot_id, {})
+                name, tagline = split_riot_id(riot_id)
+                players.append({
+                    "name": name or riot_id,
+                    "tagline": tagline or "",
+                    "team": lp.get("team"),
+                    "champion": lp.get("champion"),
+                    "level": lp.get("level"),
+                    "kills": lp.get("kills"),
+                    "deaths": lp.get("deaths"),
+                    "assists": lp.get("assists"),
+                    "cs": lp.get("cs"),
+                    "is_dead": lp.get("is_dead"),
+                    "respawn_timer": lp.get("respawn_timer"),
+                    "is_bot": lp.get("is_bot"),
+                    # From the pre-game snapshot; absent if we never scouted them.
+                    "rank": scouted.get("rank"),
+                    "trends": scouted.get("trends"),
+                })
+            return {
+                "state": "in_game",
+                "players": players,
+                "region": region,
+                "game_time": live["game_time"],
+            }
         
         # Live Client API not up yet => loading screen
         # Try to get both teams from LCU gameflow first
@@ -804,7 +837,10 @@ async def champ_select(region: str = None):
             
             for r, vp in zip(results, valid_players):
                 r["team"] = vp["team"]
-            
+
+            # Snapshot for the in-game view, which makes no API calls of its own.
+            _scout_snapshot.update({f"{r['name']}#{r['tagline']}": r for r in results})
+
             return {
                 "state": "loading",
                 "players": results,
@@ -857,6 +893,10 @@ async def champ_select(region: str = None):
         results = await asyncio.gather(*calls)
         for r, p in zip(results, cs_players):
             r["champion"] = p.get("champion")
+
+        # Seed the snapshot early; the loading screen tops it up with the enemy team.
+        _scout_snapshot.update({f"{r['name']}#{r['tagline']}": r for r in results})
+
         return {
             "state": "champ_select",
             "players": results,

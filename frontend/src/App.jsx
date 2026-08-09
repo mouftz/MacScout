@@ -68,9 +68,50 @@ function PlayerCard({ player }) {
     );
 }
 
+function LiveRow({ player }) {
+    const kda = `${player.kills}/${player.deaths}/${player.assists}`;
+    const tag = player.trends?.tag;
+
+    return (
+        <div className={`live-row ${player.is_dead ? 'dead' : ''}`}>
+            <span className="live-champ">{player.champion}</span>
+            <span className="live-level">{player.level}</span>
+            <span className="live-kda">{kda}</span>
+            <span className="live-cs">{player.cs} cs</span>
+            {player.rank && <span className="live-rank">{player.rank}</span>}
+            {tag && <span className={`live-tag tag-${player.trends.tag_kind || 'generic'}`}>{tag}</span>}
+            {player.is_dead && player.respawn_timer > 0 && (
+                <span className="live-respawn">{Math.ceil(player.respawn_timer)}s</span>
+            )}
+        </div>
+    );
+}
+
+function InGameOverlay({ players, gameTime }) {
+    const order = players.filter(p => p.team === 'ORDER');
+    const chaos = players.filter(p => p.team === 'CHAOS');
+    const mins = Math.floor(gameTime / 60);
+    const secs = String(Math.floor(gameTime % 60)).padStart(2, '0');
+
+    return (
+        <div className="ingame-overlay">
+            <div className="live-clock">{mins}:{secs}</div>
+            <div className="live-teams">
+                <div className="live-team live-team-order">
+                    {order.map((p, i) => <LiveRow key={`o-${p.name}-${i}`} player={p} />)}
+                </div>
+                <div className="live-team live-team-chaos">
+                    {chaos.map((p, i) => <LiveRow key={`c-${p.name}-${i}`} player={p} />)}
+                </div>
+            </div>
+        </div>
+    );
+}
+
 function App() {
     const [state, setState] = useState("idle");
     const [players, setPlayers] = useState([]);
+    const [gameTime, setGameTime] = useState(0);
 
     useEffect(() => {
         async function fetchState() {
@@ -79,13 +120,18 @@ function App() {
                 const data = await response.json();
                 setState(data.state);
                 setPlayers(data.players || []);
+                setGameTime(data.game_time || 0);
             } catch (err) {
                 console.error("Backend not reachable", err);
             }
         }
-        
+
         fetchState();
-        const intervalMs = state === "loading" || state === "champ_select" ? 5000 : 15000;
+        // In-game reads only local APIs, so it can poll fast without cost.
+        const intervalMs =
+            state === "in_game" ? 2000
+            : state === "loading" || state === "champ_select" ? 5000
+            : 15000;
         const interval = setInterval(fetchState, intervalMs);
         return () => clearInterval(interval);
     }, [state]);
@@ -95,20 +141,20 @@ function App() {
         return (teamOrder[a.team] ?? 2) - (teamOrder[b.team] ?? 2);
     });
 
+    if (state === "in_game") {
+        return <InGameOverlay players={players} gameTime={gameTime} />;
+    }
+
     return (
         <div className="cards-container">
-            {state === "in_game" ? null : (
-                <>
-                    <div className="status-text">
-                        {state === "idle" && "Waiting…"}
-                        {state === "loading" && "Loading screen"}
-                        {state === "champ_select" && "Champ select"}
-                    </div>
-                    {sortedPlayers.map((p, i) => (
-                        <PlayerCard key={`${p.team || 'player'}-${p.name}-${p.tagline}-${i}`} player={p} />
-                    ))}
-                </>
-            )}
+            <div className="status-text">
+                {state === "idle" && "Waiting…"}
+                {state === "loading" && "Loading screen"}
+                {state === "champ_select" && "Champ select"}
+            </div>
+            {sortedPlayers.map((p, i) => (
+                <PlayerCard key={`${p.team || 'player'}-${p.name}-${p.tagline}-${i}`} player={p} />
+            ))}
         </div>
     );
 }
