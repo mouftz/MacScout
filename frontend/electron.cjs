@@ -49,6 +49,15 @@ app.whenReady().then(() => {
         else win.show();
     });
 
+    // Cmd+Shift+C -> collapse to a small pill / expand again.
+    // Dispatching straight into the page avoids needing a preload + IPC bridge
+    // just to flip one boolean.
+    globalShortcut.register('CommandOrControl+Shift+C', () => {
+        win.webContents.executeJavaScript(
+            'window.dispatchEvent(new CustomEvent("macscout:toggle-collapse"))'
+        ).catch(() => {});
+    });
+
     // Cmd+Shift+Q -> quit the overlay
     globalShortcut.register('CommandOrControl+Shift+Q', () => {
         app.quit();

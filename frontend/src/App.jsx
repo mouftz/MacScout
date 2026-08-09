@@ -112,6 +112,14 @@ function App() {
     const [state, setState] = useState("idle");
     const [players, setPlayers] = useState([]);
     const [gameTime, setGameTime] = useState(0);
+    const [collapsed, setCollapsed] = useState(false);
+
+    // Fired by the Cmd+Shift+C global shortcut in electron.cjs.
+    useEffect(() => {
+        const toggle = () => setCollapsed(c => !c);
+        window.addEventListener("macscout:toggle-collapse", toggle);
+        return () => window.removeEventListener("macscout:toggle-collapse", toggle);
+    }, []);
 
     useEffect(() => {
         async function fetchState() {
@@ -145,16 +153,42 @@ function App() {
         return <InGameOverlay players={players} gameTime={gameTime} />;
     }
 
+    if (collapsed) {
+        return (
+            <div className="collapsed-pill">
+                MacScout · {players.length} · ⌘⇧C
+            </div>
+        );
+    }
+
+    const order = sortedPlayers.filter(p => p.team === "ORDER");
+    const chaos = sortedPlayers.filter(p => p.team === "CHAOS");
+    // Champ select has no team split (Riot hides the enemy team), so those
+    // players carry no team and render as a single column.
+    const unteamed = sortedPlayers.filter(p => !p.team);
+
+    const renderCard = (p, i) => (
+        <PlayerCard key={`${p.team || 'player'}-${p.name}-${p.tagline}-${i}`} player={p} />
+    );
+
     return (
-        <div className="cards-container">
+        <div className="overlay-root">
             <div className="status-text">
                 {state === "idle" && "Waiting…"}
                 {state === "loading" && "Loading screen"}
                 {state === "champ_select" && "Champ select"}
             </div>
-            {sortedPlayers.map((p, i) => (
-                <PlayerCard key={`${p.team || 'player'}-${p.name}-${p.tagline}-${i}`} player={p} />
-            ))}
+            <div className="teams-layout">
+                {order.length > 0 && (
+                    <div className="team-column">{order.map(renderCard)}</div>
+                )}
+                {chaos.length > 0 && (
+                    <div className="team-column">{chaos.map(renderCard)}</div>
+                )}
+                {unteamed.length > 0 && (
+                    <div className="team-column">{unteamed.map(renderCard)}</div>
+                )}
+            </div>
         </div>
     );
 }

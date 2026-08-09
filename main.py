@@ -29,6 +29,9 @@ _last_champ_select = None
 # Scouting results captured pre-game, keyed "name#tagline". The in-game view
 # reads from this instead of re-querying Riot, so a long game costs no quota.
 _scout_snapshot = {}
+# Riot IDs we have already tried to scout, so a failed or mid-game backfill is
+# attempted once rather than on every poll.
+_scout_attempted = set()
 
 # How many recent matches to pull per player. This is the main lever on rate
 # limiting: each match costs one request, and a personal key only affords
@@ -709,40 +712,52 @@ def get_live_game_data():
         
         gamestats_resp = httpx.get(gamestats_url, verify=False, timeout=2.0)
         if gamestats_resp.status_code != 200:
+            print(f"[live] gamestats {gamestats_resp.status_code}", flush=True)
             return None
-        
+
         playerlist_resp = httpx.get(playerlist_url, verify=False, timeout=2.0)
         if playerlist_resp.status_code != 200:
+            print(f"[live] playerlist {playerlist_resp.status_code}", flush=True)
             return None
-        
+
         gamestats = gamestats_resp.json()
         playerlist = playerlist_resp.json()
-        
+
+        # Defensive throughout: one unexpected entry (a bot, a renamed field)
+        # must not blank the whole overlay.
         live_players = {}
         for p in playerlist:
-            key = f"{p['riotIdGameName']}#{p['riotIdTagLine']}"
+            name = p.get('riotIdGameName') or p.get('summonerName') or ''
+            tagline = p.get('riotIdTagLine') or ''
+            if not name:
+                continue
+            key = f"{name}#{tagline}" if tagline else name
+            scores = p.get('scores') or {}
             live_players[key] = {
-                "champion": p['championName'],
-                "level": p['level'],
-                "kills": p['scores']['kills'],
-                "deaths": p['scores']['deaths'],
-                "assists": p['scores']['assists'],
-                "cs": p['scores']['creepScore'],
-                "items": [item['displayName'] for item in p.get('items', [])],
-                "team": p['team'],
-                "is_dead": p['isDead'],
-                "respawn_timer": p['respawnTimer'],
-                "is_bot": p['isBot'],
+                "champion": p.get('championName'),
+                "level": p.get('level'),
+                "kills": scores.get('kills', 0),
+                "deaths": scores.get('deaths', 0),
+                "assists": scores.get('assists', 0),
+                "cs": scores.get('creepScore', 0),
+                "items": [i.get('displayName') for i in p.get('items', [])],
+                "team": p.get('team'),
+                "is_dead": p.get('isDead', False),
+                "respawn_timer": p.get('respawnTimer', 0),
+                "is_bot": p.get('isBot', False),
             }
-        
+
         return {
-            "game_time": gamestats['gameTime'],
-            "game_mode": gamestats['gameMode'],
+            "game_time": gamestats.get('gameTime', 0),
+            "game_mode": gamestats.get('gameMode'),
             "players": live_players
         }
-    except (httpx.ConnectError, httpx.TimeoutException):
+    except (httpx.ConnectError, httpx.TimeoutException) as e:
+        # Expected outside a game: the API only listens while one is running.
+        print(f"[live] not reachable: {type(e).__name__}", flush=True)
         return None
-    except Exception:
+    except Exception as e:
+        print(f"[live] EXCEPTION: {type(e).__name__}: {e}", flush=True)
         return None
 
 @app.get("/champ-select")
@@ -768,12 +783,39 @@ async def champ_select(region: str = None):
     # === In-game or loading screen ===
     if phase == "InProgress":
         live = get_live_game_data()
-        
+        print(
+            f"[in_game] live={'present' if live else 'None'} "
+            f"game_time={live.get('game_time') if live else 'n/a'} "
+            f"live_players={len(live.get('players', {})) if live else 0} "
+            f"snapshot={len(_scout_snapshot)}",
+            flush=True,
+        )
+
         if live is not None and live.get("game_time", 0) > 5.0:
             # Merge live stats with the scouting snapshot taken at the loading
             # screen. Deliberately no Riot API calls here: the Live Client API
             # is local and unmetered, and a 25-minute game polling every few
             # seconds would otherwise burn the rate limit for nothing.
+            # If we never scouted these players (backend restarted, or the
+            # overlay was launched mid-game), backfill once. Guarded by
+            # _scout_attempted, which is updated before the await so
+            # overlapping polls cannot start duplicate backfills.
+            live_ids = list(live.get("players", {}).keys())
+            missing = [
+                rid for rid in live_ids
+                if rid not in _scout_snapshot and rid not in _scout_attempted
+            ]
+            if missing:
+                _scout_attempted.update(missing)
+                backfill_queue = (_last_champ_select or {}).get("queue_id", 0)
+                print(f"[in_game] backfilling {len(missing)} unscouted players", flush=True)
+                pairs = [split_riot_id(rid) for rid in missing]
+                backfill = await asyncio.gather(*[
+                    get_player_info_solo(n, t, platform, riot_region, backfill_queue)
+                    for n, t in pairs if n and t
+                ])
+                _scout_snapshot.update({f"{r['name']}#{r['tagline']}": r for r in backfill})
+
             players = []
             for riot_id, lp in live.get("players", {}).items():
                 scouted = _scout_snapshot.get(riot_id, {})
