@@ -36,8 +36,16 @@ function createWindow() {
     // Make the window click-through everywhere
     win.setIgnoreMouseEvents(true, { forward: true });
     
-    // Keep visible when League goes fullscreen on macOS
+    // Keep visible when League goes fullscreen on macOS.
+    //
+    // `alwaysOnTop: true` alone uses the 'floating' window level, which sits
+    // above normal windows but *below* a fullscreen app — so the overlay would
+    // vanish the moment the game starts. 'screen-saver' is the highest
+    // practical level and is what actually floats above fullscreen.
+    win.setAlwaysOnTop(true, 'screen-saver');
     win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    // Stop the overlay itself from being pulled into its own fullscreen Space.
+    win.setFullScreenable(false);
 }
 
 app.whenReady().then(() => {
