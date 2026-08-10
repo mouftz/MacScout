@@ -154,6 +154,43 @@ async def get_champion_map() -> dict:
         return {}
 
 
+RANK_TIERS = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD",
+              "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"]
+RANK_DIVISIONS = ["IV", "III", "II", "I"]
+
+
+def rank_to_number(rank: str | None) -> int | None:
+    """Order a 'GOLD II' style rank so ranks can be compared and averaged."""
+    if not rank:
+        return None
+    parts = rank.upper().split()
+    if not parts or parts[0] not in RANK_TIERS:
+        return None  # Unranked / Unknown
+    tier = RANK_TIERS.index(parts[0]) * 4
+    division = RANK_DIVISIONS.index(parts[1]) if len(parts) > 1 and parts[1] in RANK_DIVISIONS else 0
+    return tier + division
+
+
+def number_to_rank(value: float) -> str:
+    tier, division = divmod(int(round(value)), 4)
+    tier = max(0, min(tier, len(RANK_TIERS) - 1))
+    name = RANK_TIERS[tier]
+    # Apex tiers have no divisions.
+    if name in ("MASTER", "GRANDMASTER", "CHALLENGER"):
+        return name
+    return f"{name} {RANK_DIVISIONS[division]}"
+
+
+def median_rank(ranks: list) -> str | None:
+    """Typical rank of a lobby, for the 'vs <rank>' header."""
+    nums = sorted(n for n in (rank_to_number(r) for r in ranks) if n is not None)
+    if not nums:
+        return None
+    mid = len(nums) // 2
+    value = nums[mid] if len(nums) % 2 else (nums[mid - 1] + nums[mid]) / 2
+    return number_to_rank(value)
+
+
 def is_riot_puuid(value: str | None) -> bool:
     """Riot API PUUIDs are long encrypted strings, not 36-char LCU UUID placeholders."""
     return bool(value and len(value) >= 60)
@@ -837,10 +874,23 @@ def get_live_game_data():
                 "is_bot": p.get('isBot', False),
             }
 
+        # Who is "you" — needed to split the panel into your stats vs the
+        # lobby's. Optional: if it fails we still return everyone else.
+        active_id = None
+        try:
+            ap = httpx.get("https://127.0.0.1:2999/liveclientdata/activeplayer",
+                           verify=False, timeout=2.0)
+            if ap.status_code == 200:
+                apd = ap.json()
+                active_id = apd.get('riotId') or apd.get('summonerName')
+        except Exception:
+            pass
+
         return {
             "game_time": gamestats.get('gameTime', 0),
             "game_mode": gamestats.get('gameMode'),
-            "players": live_players
+            "players": live_players,
+            "active_player": active_id,
         }
     except (httpx.ConnectError, httpx.TimeoutException) as e:
         # Expected outside a game: the API only listens while one is running.
@@ -944,11 +994,43 @@ async def _champ_select_inner(region: str = None):
                     "rank": scouted.get("rank"),
                     "trends": scouted.get("trends"),
                 })
+            # Personal panel: your live rates vs this lobby's. Every number is
+            # measured — no invented rank benchmarks.
+            minutes = max(live["game_time"] / 60.0, 1 / 60.0)
+
+            def rates(p):
+                deaths = p.get("deaths") or 0
+                kills = p.get("kills") or 0
+                assists = p.get("assists") or 0
+                return {
+                    "cs_per_min": round((p.get("cs") or 0) / minutes, 1),
+                    "kills": kills, "deaths": deaths, "assists": assists,
+                    "kda_ratio": round((kills + assists) / deaths, 2) if deaths else float(kills + assists),
+                }
+
+            active_id = live.get("active_player")
+            you = next((p for p in players if f"{p['name']}#{p['tagline']}" == active_id), None)
+            if you is None and active_id:
+                # riotId formatting can differ; fall back to matching the name.
+                you = next((p for p in players if p["name"] == str(active_id).split("#")[0]), None)
+
+            others = [p for p in players if p is not you and not p.get("is_bot")]
+            avg = None
+            if others:
+                r = [rates(p) for p in others]
+                avg = {
+                    "cs_per_min": round(sum(x["cs_per_min"] for x in r) / len(r), 1),
+                    "kda_ratio": round(sum(x["kda_ratio"] for x in r) / len(r), 2),
+                }
+
             return {
                 "state": "in_game",
                 "players": players,
                 "region": region,
                 "game_time": live["game_time"],
+                "you": rates(you) if you else None,
+                "lobby_avg": avg,
+                "lobby_rank": median_rank([p.get("rank") for p in players]),
             }
         
         # Live Client API not up yet => loading screen

@@ -68,42 +68,37 @@ function PlayerCard({ player }) {
     );
 }
 
-function LiveRow({ player }) {
-    const kda = `${player.kills}/${player.deaths}/${player.assists}`;
-    const tag = player.trends?.tag;
-
+function StatRow({ label, mine, avg, decimals = 1 }) {
+    const better = mine != null && avg != null && mine >= avg;
+    // Fix the decimals so the two columns stay comparable at a glance —
+    // otherwise a whole-number KDA renders as "5" next to an average of "2.31".
+    const fmt = v => (v == null ? '—' : v.toFixed(decimals));
     return (
-        <div className={`live-row ${player.is_dead ? 'dead' : ''}`}>
-            <span className="live-champ">{player.champion}</span>
-            <span className="live-level">{player.level}</span>
-            <span className="live-kda">{kda}</span>
-            <span className="live-cs">{player.cs} cs</span>
-            {player.rank && <span className="live-rank">{player.rank}</span>}
-            {tag && <span className={`live-tag tag-${player.trends.tag_kind || 'generic'}`}>{tag}</span>}
-            {player.is_dead && player.respawn_timer > 0 && (
-                <span className="live-respawn">{Math.ceil(player.respawn_timer)}s</span>
-            )}
+        <div className="stat-row">
+            <span className={`stat-mine ${better ? 'ahead' : 'behind'}`}>{fmt(mine)}</span>
+            <span className="stat-avg">{fmt(avg)}</span>
+            <span className="stat-label">{label}</span>
         </div>
     );
 }
 
-function InGameOverlay({ players, gameTime }) {
-    const order = players.filter(p => p.team === 'ORDER');
-    const chaos = players.filter(p => p.team === 'CHAOS');
+function InGamePanel({ you, avg, lobbyRank, gameTime }) {
     const mins = Math.floor(gameTime / 60);
-    const secs = String(Math.floor(gameTime % 60)).padStart(2, '0');
 
     return (
-        <div className="ingame-overlay">
-            <div className="live-clock">{mins}:{secs}</div>
-            <div className="live-teams">
-                <div className="live-team live-team-order">
-                    {order.map((p, i) => <LiveRow key={`o-${p.name}-${i}`} player={p} />)}
-                </div>
-                <div className="live-team live-team-chaos">
-                    {chaos.map((p, i) => <LiveRow key={`c-${p.name}-${i}`} player={p} />)}
-                </div>
+        <div className="ingame-panel">
+            <div className="panel-header">
+                <span className="panel-vs">vs</span>
+                <span className="panel-rank">{lobbyRank || 'Unranked lobby'}</span>
+                <span className="panel-time">~{mins}m</span>
             </div>
+            <div className="panel-cols">
+                <span className="col-mine">Your</span>
+                <span className="col-avg">Avg.</span>
+                <span className="col-spacer" />
+            </div>
+            <StatRow label="CS/Min" mine={you?.cs_per_min} avg={avg?.cs_per_min} decimals={1} />
+            <StatRow label="KDA" mine={you?.kda_ratio} avg={avg?.kda_ratio} decimals={2} />
         </div>
     );
 }
@@ -113,6 +108,9 @@ function App() {
     const [players, setPlayers] = useState([]);
     const [gameTime, setGameTime] = useState(0);
     const [collapsed, setCollapsed] = useState(false);
+    const [you, setYou] = useState(null);
+    const [lobbyAvg, setLobbyAvg] = useState(null);
+    const [lobbyRank, setLobbyRank] = useState(null);
 
     // Fired by the Cmd+Shift+C global shortcut in electron.cjs.
     useEffect(() => {
@@ -129,6 +127,9 @@ function App() {
                 setState(data.state);
                 setPlayers(data.players || []);
                 setGameTime(data.game_time || 0);
+                setYou(data.you || null);
+                setLobbyAvg(data.lobby_avg || null);
+                setLobbyRank(data.lobby_rank || null);
             } catch (err) {
                 console.error("Backend not reachable", err);
             }
@@ -150,7 +151,7 @@ function App() {
     });
 
     if (state === "in_game") {
-        return <InGameOverlay players={players} gameTime={gameTime} />;
+        return <InGamePanel you={you} avg={lobbyAvg} lobbyRank={lobbyRank} gameTime={gameTime} />;
     }
 
     if (collapsed) {
